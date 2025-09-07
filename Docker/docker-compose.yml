@@ -1,0 +1,452 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # MongoDB for historical data and strategy storage
+  mongodb:
+    image: mongo:7.0
+    container_name: gotobots_mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: gotobots
+      MONGO_INITDB_ROOT_PASSWORD: gotobots_password
+    volumes:
+      - mongodb_data:/data/db
+      - ./mongo-init:/docker-entrypoint-initdb.d
+    networks:
+      - gotobots_network
+
+  # Redis for real-time data streaming and caching
+  redis:
+    image: redis:7.2-alpine
+    container_name: gotobots_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass gotobots_redis_password
+    volumes:
+      - redis_data:/data
+    networks:
+      - gotobots_network
+
+  # FastAPI Backend Application
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gotobots_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # MongoDB Configuration
+      MONGODB_URL: mongodb://gotobots:gotobots_password@mongodb:27017/
+      MONGODB_DB_HISTORICAL: gotobots_historical
+      MONGODB_DB_STRATEGIES: gotobots_strategies
+      
+      # Redis Configuration
+      REDIS_URL: redis://:gotobots_redis_password@redis:6379
+      REDIS_DB: 0
+      
+      # Application Configuration
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      
+      # Binance API (set your actual keys)
+      BINANCE_API_KEY: ${BINANCE_API_KEY:-your_binance_api_key}
+      BINANCE_SECRET_KEY: ${BINANCE_SECRET_KEY:-your_binance_secret_key}
+      BINANCE_TESTNET: "true"
+      
+      # Risk Management
+      MAX_LEVERAGE_GLOBAL: 3.0
+      MAX_DRAWDOWN_GLOBAL: 20.0
+      MAX_DAILY_RISK_GLOBAL: 5.0
+    depends_on:
+      - mongodb
+      - redis
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+    networks:
+      - gotobots_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Risk Guardian Service (separate container for isolation)
+  risk_guardian:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.risk_guardian
+    container_name: gotobots_risk_guardian
+    restart: unless-stopped
+    environment:
+      MONGODB_URL: mongodb://gotobots:gotobots_password@mongodb:27017/
+      REDIS_URL: redis://:gotobots_redis_password@redis:6379
+      LOG_LEVEL: INFO
+    depends_on:
+      - mongodb
+      - redis
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - gotobots_network
+
+  # Nginx reverse proxy (optional)
+  nginx:
+    image: nginx:alpine
+    container_name: gotobots_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+    networks:
+      - gotobots_network
+
+volumes:
+  mongodb_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  gotobots_network:
+    driver: bridge
+
+---
+
+# backend/Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create logs directory
+RUN mkdir -p logs
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/healthz || exit 1
+
+# Run the application
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+
+---
+
+# backend/Dockerfile.risk_guardian
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create logs directory
+RUN mkdir -p logs
+
+# Risk Guardian entry point
+CMD ["python", "-m", "app.services.risk_guardian.main"]
+
+---
+
+# nginx/nginx.conf
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream backend {
+        server backend:8000;
+    }
+    
+    # Rate limiting
+    limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+    
+    server {
+        listen 80;
+        server_name localhost;
+        
+        # Security headers
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer-when-downgrade" always;
+        add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'" always;
+        
+        # API routes
+        location /api/ {
+            limit_req zone=api burst=20 nodelay;
+            
+            proxy_pass http://backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # WebSocket support
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+        }
+        
+        # Health check
+        location /healthz {
+            proxy_pass http://backend;
+            access_log off;
+        }
+        
+        # Static files (if any)
+        location /static/ {
+            alias /app/static/;
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+        
+        # Default location
+        location / {
+            return 404;
+        }
+    }
+}
+
+---
+
+# .dockerignore
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Data
+data/
+*.db
+*.sqlite
+
+# Temporary files
+tmp/
+temp/
+
+---
+
+# mongo-init/init-mongo.js
+// MongoDB initialization script
+db = db.getSiblingDB('gotobots_historical');
+
+// Create collections and indexes for historical data
+db.createCollection('ohlcv_1m');
+db.ohlcv_1m.createIndex({ "exchange": 1, "symbol": 1, "timestamp": 1 }, { unique: true });
+db.ohlcv_1m.createIndex({ "symbol": 1, "timestamp": 1 });
+db.ohlcv_1m.createIndex({ "timestamp": 1 });
+
+db.createCollection('ohlcv_5m');
+db.ohlcv_5m.createIndex({ "exchange": 1, "symbol": 1, "timestamp": 1 }, { unique: true });
+
+db.createCollection('ohlcv_15m');
+db.ohlcv_15m.createIndex({ "exchange": 1, "symbol": 1, "timestamp": 1 }, { unique: true });
+
+db.createCollection('ohlcv_1h');
+db.ohlcv_1h.createIndex({ "exchange": 1, "symbol": 1, "timestamp": 1 }, { unique: true });
+
+db.createCollection('features_1m');
+db.features_1m.createIndex({ "symbol": 1, "timestamp": 1 });
+
+db.createCollection('features_5m');
+db.features_5m.createIndex({ "symbol": 1, "timestamp": 1 });
+
+// Create strategies database
+db = db.getSiblingDB('gotobots_strategies');
+
+db.createCollection('strategies');
+db.strategies.createIndex({ "created_at": -1 });
+db.strategies.createIndex({ "user_query": "text" });
+
+db.createCollection('backtests');
+db.backtests.createIndex({ "strategy_id": 1, "created_at": -1 });
+db.backtests.createIndex({ "created_at": -1 });
+
+db.createCollection('exchange_filters');
+db.exchange_filters.createIndex({ "exchange": 1, "symbol": 1, "as_of": -1 });
+
+print('MongoDB initialization completed');
+
+---
+
+# scripts/start-dev.sh
+#!/bin/bash
+
+# Development startup script
+echo "Starting GoToBots Strategy Builder (Development Mode)"
+
+# Check if .env file exists
+if [ ! -f .env ]; then
+    echo "Creating .env file from template..."
+    cp .env.example .env
+    echo "Please edit .env file with your configuration"
+fi
+
+# Start services with development overrides
+docker-compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+
+---
+
+# scripts/stop-all.sh
+#!/bin/bash
+
+echo "Stopping all GoToBots services..."
+
+# Stop containers
+docker-compose down
+
+# Optional: Remove volumes (uncomment if you want to reset all data)
+# docker-compose down -v
+
+echo "All services stopped"
+
+---
+
+# scripts/backup-db.sh
+#!/bin/bash
+
+# Database backup script
+BACKUP_DIR="./backups/$(date +%Y%m%d_%H%M%S)"
+mkdir -p $BACKUP_DIR
+
+echo "Creating database backup in $BACKUP_DIR"
+
+# Backup MongoDB
+docker exec gotobots_mongodb mongodump --host localhost --port 27017 \
+    --username gotobots --password gotobots_password \
+    --out /tmp/backup
+
+docker cp gotobots_mongodb:/tmp/backup $BACKUP_DIR/mongodb
+
+# Backup Redis
+docker exec gotobots_redis redis-cli --rdb /tmp/dump.rdb
+docker cp gotobots_redis:/tmp/dump.rdb $BACKUP_DIR/redis_dump.rdb
+
+echo "Backup completed: $BACKUP_DIR"
+
+---
+
+# docker-compose.dev.yml
+# Development overrides
+version: '3.8'
+
+services:
+  backend:
+    volumes:
+      - ./backend:/app
+    environment:
+      DEBUG: "true"
+      LOG_LEVEL: DEBUG
+    ports:
+      - "8000:8000"
+      - "5678:5678"  # debugpy port
+    command: ["python", "-m", "debugpy", "--listen", "0.0.0.0:5678", "--wait-for-client", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+  risk_guardian:
+    volumes:
+      - ./backend:/app
+    environment:
+      LOG_LEVEL: DEBUG
