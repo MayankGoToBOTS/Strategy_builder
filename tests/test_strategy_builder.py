@@ -1,4 +1,4 @@
-# backend/tests/test_strategy_builder.py
+# path: tests/test_strategy_builder.py
 import pytest
 from httpx import AsyncClient
 from app.main import app
@@ -10,17 +10,57 @@ class TestStrategyBuilder:
     """Test strategy builder orchestrator"""
     
     async def setup_databases(self):
-        """Initialize databases for testing"""
+        """Initialize and clean databases for testing"""
         try:
             await MongoManager.initialize()
             await RedisManager.initialize()
+            
+            # Clean test databases to ensure test isolation
+            await self.cleanup_test_data()
+            
         except Exception as e:
             # If databases are not available, skip tests that need them
             pytest.skip(f"Databases not available for testing: {e}")
     
+    async def cleanup_test_data(self):
+        """Clean up test data from databases"""
+        try:
+            # Get database instances
+            historical_db = MongoManager.get_historical_db()
+            strategies_db = MongoManager.get_strategies_db()
+            redis = RedisManager.get_redis()
+            
+            # Clean strategies database collections
+            try:
+                await strategies_db.drop_collection("strategies")
+                await strategies_db.drop_collection("backtests")
+                await strategies_db.drop_collection("exchange_filters")
+            except Exception:
+                pass  # Collections might not exist
+            
+            # Clean historical database collections  
+            try:
+                await historical_db.drop_collection("ohlcv_1m")
+                await historical_db.drop_collection("features_1m")
+            except Exception:
+                pass  # Collections might not exist
+            
+            # Clean Redis test database
+            try:
+                await redis.flushdb()
+            except Exception:
+                pass  # Redis might not be available
+                
+        except Exception as e:
+            # If cleanup fails, log but don't fail the test
+            print(f"Warning: Failed to cleanup test data: {e}")
+    
     async def cleanup_databases(self):
         """Cleanup databases after testing"""
         try:
+            # Clean up test data before closing connections
+            await self.cleanup_test_data()
+            
             await MongoManager.close()
             await RedisManager.close()
         except Exception:
