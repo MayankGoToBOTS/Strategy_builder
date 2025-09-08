@@ -2,7 +2,7 @@
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.core.config import settings
 import logging
 
@@ -38,7 +38,8 @@ class RiskManager:
         self.current_drawdown = 0.0
         self.positions: Dict[str, Dict] = {}
         self.daily_trades = 0
-        self.last_reset_date = datetime.utcnow().date()
+        # Fixed: Use timezone-aware datetime
+        self.last_reset_date = datetime.now(timezone.utc).date()
         
         # Global risk limits
         self.limits = RiskLimits(
@@ -163,7 +164,8 @@ class RiskManager:
                     "side": side,
                     "leverage": leverage,
                     "unrealized_pnl": 0.0,
-                    "last_update": datetime.utcnow()
+                    # Fixed: Use timezone-aware datetime
+                    "last_update": datetime.now(timezone.utc)
                 }
             
             position = self.positions[symbol]
@@ -191,7 +193,8 @@ class RiskManager:
                     position["avg_price"] = entry_price
             
             position["leverage"] = leverage
-            position["last_update"] = datetime.utcnow()
+            # Fixed: Use timezone-aware datetime
+            position["last_update"] = datetime.now(timezone.utc)
             
         except Exception as e:
             logger.error(f"Position update failed: {e}")
@@ -251,7 +254,8 @@ class RiskManager:
     
     def reset_daily_metrics(self):
         """Reset daily metrics at start of new trading day"""
-        current_date = datetime.utcnow().date()
+        # Fixed: Use timezone-aware datetime
+        current_date = datetime.now(timezone.utc).date()
         
         if current_date != self.last_reset_date:
             self.daily_pnl = 0.0

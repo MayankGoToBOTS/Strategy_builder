@@ -106,10 +106,14 @@ class Compliance(BaseModel):
     max_position_hours: int = 6
     no_overnight_futures: bool = False
 
+# Fixed BacktestPeriod: Removed aliases to avoid confusion
 class BacktestPeriod(BaseModel):
     from_date: str = Field(alias="from")
     to_date: str = Field(alias="to")
     mode: Literal["in_sample", "oos"]
+    
+    class Config:
+        allow_population_by_field_name = True  # Allow both field name and alias
 
 class BacktestConfig(BaseModel):
     periods: List[BacktestPeriod]

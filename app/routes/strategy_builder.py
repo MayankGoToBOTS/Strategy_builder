@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import List, Dict, Optional, Tuple
 import re
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 
@@ -594,7 +594,8 @@ class StrategyOrchestrator:
     def _create_backtest_config(self, user_request: UserRequest) -> BacktestConfig:
         """Create backtesting configuration"""
         # Determine backtest period based on time horizon
-        end_date = datetime.utcnow().strftime("%Y-%m-%d")
+        # Fixed: Use UTC timezone-aware datetime
+        end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         
         horizon_days = {
             "day": 30,
@@ -603,13 +604,12 @@ class StrategyOrchestrator:
             "year": 365
         }.get(user_request.time_horizon.unit, 180)
         
-        start_date = (datetime.utcnow() - timedelta(days=horizon_days)).strftime("%Y-%m-%d")
+        start_date = (datetime.now(timezone.utc) - timedelta(days=horizon_days)).strftime("%Y-%m-%d")
         
+        # Fixed: Use correct field names for BacktestPeriod
         return BacktestConfig(
             periods=[BacktestPeriod(
-                from_date=start_date,
-                to_date=end_date,
-                mode="in_sample"
+                **{"from": start_date, "to": end_date, "mode": "in_sample"}
             )],
             fees_schema="binance_futures_default",
             latency_ms=80
@@ -765,7 +765,7 @@ class StrategyOrchestrator:
 
 ---
 **Strategy ID:** `{strategy_spec.id}`
-**Generated:** {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")} UTC
+**Generated:** {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")} UTC
 """
             
             return report
@@ -783,7 +783,7 @@ class StrategyOrchestrator:
             strategy_doc = {
                 "_id": strategy_spec.id,
                 "strategy_spec": strategy_spec.dict(),
-                "created_at": datetime.utcnow(),
+                "created_at": datetime.now(timezone.utc),
                 "user_query": strategy_spec.user_request.raw,
                 "feasibility_assessment": strategy_spec.feasibility.assessment,
                 "expected_return": strategy_spec.results.summary.net_return_pct,
